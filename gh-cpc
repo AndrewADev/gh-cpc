@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# gh cpc: cherry-pick a commit onto a fresh branch (from origin/<base>) in its
+# own worktree, push it, and optionally open a PR.
+
+set -uo pipefail
+
+BRANCH_MAX_LEN="${BRANCH_MAX_LEN:-60}"
+BASE="${GH_CPC_BASE:-main}"
+
+log() { printf '[cpc] %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat >&2 <<EOF
+Usage: gh cpc <commit>
+
+Creates a branch from origin/$BASE named after the commit's conventional-commit
+subject (e.g. "feat(parser): add yaml support" -> feat/parser/add-yaml-support),
+in its own worktree under worktrees/, cherry-picks the commit, pushes it, and
+prompts to open a PR (with optional labels).
+
+Environment:
+  GH_CPC_BASE       Base branch on origin (default: main)
+  BRANCH_MAX_LEN    Maximum branch name length (default: 60)
+EOF
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+[[ $# -eq 1 ]] || { usage; exit 1; }
+case "$1" in -h|--help) usage; exit 0;; esac
+
+COMMIT_INPUT="$1"
+
+have git || die "git is required."
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository."
+
+COMMIT_FULL="$(git rev-parse --verify "${COMMIT_INPUT}^{commit}" 2>/dev/null)" \
+  || die "Could not resolve '$COMMIT_INPUT' to a commit."
+SHORT_HASH="$(git rev-parse --short "$COMMIT_FULL")"
+
+GIT_COMMON_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+MAIN_ROOT="$(dirname "$GIT_COMMON_DIR")"
+
+log "Fetching origin/$BASE..."
+git fetch origin "$BASE" || die "Failed to fetch origin/$BASE."
+
+SUBJECT="$(git log -1 --format=%s "$COMMIT_FULL")"
+log "Commit $SHORT_HASH: $SUBJECT"
+
+TYPE=""
+SCOPE=""
+DESC=""
+CONVENTIONAL_RE='^([A-Za-z]+)(\(([^)]+)\))?!?:[[:space:]]*(.+)$'
+if [[ $SUBJECT =~ $CONVENTIONAL_RE ]]; then
+  TYPE="${BASH_REMATCH[1]}"
+  SCOPE="${BASH_REMATCH[3]}"
+  DESC="${BASH_REMATCH[4]}"
+else
+  TYPE="chore"
+  DESC="$SUBJECT"
+fi
+
+TYPE_SLUG="$(slugify "$TYPE")"
+[[ -n "$TYPE_SLUG" ]] || TYPE_SLUG="chore"
+SCOPE_SLUG=""
+[[ -n "$SCOPE" ]] && SCOPE_SLUG="$(slugify "$SCOPE")"
+DESC_SLUG="$(slugify "$DESC")"
+[[ -n "$DESC_SLUG" ]] || DESC_SLUG="change-$SHORT_HASH"
+
+if [[ -n "$SCOPE_SLUG" ]]; then
+  PREFIX="$TYPE_SLUG/$SCOPE_SLUG"
+else
+  PREFIX="$TYPE_SLUG"
+fi
+BRANCH="$PREFIX/$DESC_SLUG"
+
+if [[ ${#BRANCH} -gt $BRANCH_MAX_LEN ]]; then
+  ALLOWED=$((BRANCH_MAX_LEN - ${#PREFIX} - 1))
+  if [[ $ALLOWED -gt 0 ]]; then
+    TRUNCATED="${DESC_SLUG:0:$ALLOWED}"
+    if [[ "$TRUNCATED" == *-* && "$TRUNCATED" != "$DESC_SLUG" ]]; then
+      TRUNCATED="${TRUNCATED%-*}"
+    fi
+    TRUNCATED="${TRUNCATED%-}"
+    [[ -n "$TRUNCATED" ]] || TRUNCATED="change"
+    DESC_SLUG="$TRUNCATED"
+    BRANCH="$PREFIX/$DESC_SLUG"
+  else
+    BRANCH="${BRANCH:0:$BRANCH_MAX_LEN}"
+    BRANCH="${BRANCH%-}"
+  fi
+  log "Branch name shortened to fit ${BRANCH_MAX_LEN} chars: $BRANCH"
+fi
+
+branch_exists() {
+  git show-ref --verify --quiet "refs/heads/$1" \
+    || git ls-remote --exit-code --heads origin "$1" >/dev/null 2>&1
+}
+
+if branch_exists "$BRANCH"; then
+  BRANCH="${BRANCH}-${SHORT_HASH}"
+  log "Branch name already taken; using $BRANCH."
+fi
+
+PATH_NAME="${BRANCH//\//-}"
+WORKTREE_DIR="$MAIN_ROOT/worktrees/$PATH_NAME"
+
+[[ ! -e "$WORKTREE_DIR" ]] || die "Worktree path already exists: $WORKTREE_DIR"
+
+log "Creating worktree at worktrees/$PATH_NAME on branch $BRANCH (from origin/$BASE)..."
+git worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$BASE" \
+  || die "Failed to create worktree."
+
+log "Cherry-picking $SHORT_HASH..."
+if ! git -C "$WORKTREE_DIR" cherry-pick "$COMMIT_FULL"; then
+  die "Cherry-pick hit a conflict. Resolve it in $WORKTREE_DIR, then run:
+  git -C \"$WORKTREE_DIR\" cherry-pick --continue
+  git -C \"$WORKTREE_DIR\" push -u origin $BRANCH"
+fi
+
+log "Pushing $BRANCH to origin..."
+git -C "$WORKTREE_DIR" push -u origin "$BRANCH" || die "Failed to push $BRANCH."
+
+log "Done. Branch $BRANCH pushed to origin (worktree: $WORKTREE_DIR)."
+
+read -r -p "Open a PR now? [y/N] " OPEN_PR
+if [[ "$OPEN_PR" =~ ^[Yy] ]]; then
+  have gh || die "gh CLI not found."
+
+  read -r -p "Labels to add (comma-separated, blank for none): " LABELS
+
+  GH_ARGS=(pr create --fill-first --head "$BRANCH" --base "$BASE")
+  [[ -n "$LABELS" ]] && GH_ARGS+=(--label "$LABELS")
+
+  (cd "$WORKTREE_DIR" && gh "${GH_ARGS[@]}")
+fi
